@@ -65,7 +65,7 @@ os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 if not tex.device_supports_multicast():
     os.environ["UB_SKIPMC"] = "1"
 
-MAX_SEQ_LEN = 4096
+MAX_SEQ_LEN = 6144
 
 @contextmanager
 def replace_decoder(te_decoder_cls):
@@ -117,6 +117,48 @@ def sequence_parallel_context(layernorm_mlp, seq_len):
         layernorm_mlp.ub_bulk_wgrad = original_ub_bulk_wgrad
         layernorm_mlp.ub_bulk_dgrad = original_ub_bulk_dgrad
 
+
+@contextmanager
+def linear_sequence_parallel_context(linear, seq_len):
+    """
+    Context manager to temporarily modify LayerNormMLP's parallel configuration
+    based on sequence length.
+    
+    When the sequence length is 1 (decode mode), disable sequence parallel and
+    related optimizations; restore original settings when exiting the context.
+    """
+    # save original settings
+    original_sequence_parallel = linear.sequence_parallel
+    original_ub_overlap_rs_fprop = linear.ub_overlap_rs_fprop
+    original_ub_overlap_ag_dgrad = linear.ub_overlap_ag_dgrad
+    original_ub_overlap_ag_fprop = linear.ub_overlap_ag_fprop
+    original_ub_overlap_rs_dgrad = linear.ub_overlap_rs_dgrad
+    original_ub_bulk_dgrad = linear.ub_bulk_dgrad
+    original_ub_bulk_wgrad = linear.ub_bulk_wgrad
+
+    
+    if seq_len == 1:  # decode mode
+        # disable SP and SP overlap settings
+        linear.sequence_parallel = False
+        linear.ub_overlap_rs_fprop = False
+        linear.ub_overlap_ag_dgrad = False
+        linear.ub_overlap_ag_fprop = False
+        linear.ub_overlap_rs_dgrad = False
+        linear.ub_bulk_dgrad = False
+        linear.ub_bulk_wgrad = False
+    
+    try:
+        yield
+    finally:
+        # restore original settings
+            linear.sequence_parallel = original_sequence_parallel
+            linear.ub_overlap_rs_fprop = original_ub_overlap_rs_fprop
+            linear.ub_overlap_ag_dgrad = original_ub_overlap_ag_dgrad
+            linear.ub_overlap_ag_fprop = original_ub_overlap_ag_fprop
+            linear.ub_overlap_rs_dgrad = original_ub_overlap_rs_dgrad 
+            linear.ub_bulk_dgrad = original_ub_bulk_dgrad 
+            linear.ub_bulk_wgrad = original_ub_bulk_wgrad 
+
 class TELlamaAttention(nn.Module):
     def __init__(
         self,
@@ -135,6 +177,7 @@ class TELlamaAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -157,22 +200,42 @@ class TELlamaAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+        from transformer_engine.pytorch import Linear
+        
+        kwargs = {
+            "params_dtype": torch.bfloat16,
+            "device": "cuda",
+            "tp_group": get_tp_group().device_group,
+            "tp_size": tp_size,
+            "sequence_parallel": config.sequence_parallel,
+            "ub_overlap_ag": config.tp_comm_overlap,
+            "ub_bulk_wgrad": config.tp_comm_overlap,
+            "ub_bulk_dgrad": config.tp_comm_overlap,
+            "ub_overlap_rs": config.tp_comm_overlap,
+            'return_bias': True,
+        }
+        
+        self.qkv_proj = Linear(
+            self.hidden_size,
+             (self.num_heads + 2 * self.num_kv_heads) * self.tp_size * self.head_dim,
+            bias=False, 
+            parameters_split={
+                "q" : self.q_size * self.tp_size,
+                "k" : self.kv_size * self.tp_size,
+                "v" : self.kv_size * self.tp_size, 
+            },
+            parallel_mode="column",
+            ub_name="qkv",
+            **kwargs
         )
-        self.o_proj = RowParallelLinear(
+
+        self.o_proj = Linear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
+            parallel_mode="row",
+            ub_name="proj",
+            **kwargs
         )
 
         self.rotary_emb = get_rope(
@@ -197,11 +260,14 @@ class TELlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        seqlen = hidden_states.shape[0]
+        with linear_sequence_parallel_context(self.qkv_proj, seqlen):
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        with linear_sequence_parallel_context(self.o_proj, seqlen):
+            output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -252,17 +318,18 @@ class TELlamaDecoderLayer(nn.Module):
         # TE's LayerNormMLP (combines post_attention_layernorm and MLP)
         # overlap configuration adapted from
         # https://github.com/NVIDIA/TransformerEngine/blob/main/examples/pytorch/comm_gemm_overlap/te_layer_with_overlap.py#L120
+        
         kwargs = {
             "params_dtype": torch.bfloat16,
             "device": "cuda",
             "tp_group": get_tp_group().device_group,
             "tp_size": tp_size,
-            "sequence_parallel": True,
-            "ub_overlap_ag": True,
-            "ub_bulk_wgrad": True,
-            "ub_bulk_dgrad": True,
+            "sequence_parallel": config.sequence_parallel,
+            "ub_overlap_ag": config.tp_comm_overlap,
+            "ub_bulk_wgrad": config.tp_comm_overlap,
+            "ub_bulk_dgrad": config.tp_comm_overlap,
             "set_parallel_mode": True,
-            "ub_overlap_rs": True,
+            "ub_overlap_rs": config.tp_comm_overlap,
             "seq_length": MAX_SEQ_LEN,
         }
         # We don't need to return_layernorm_output and return_layernorm_output_gathered
@@ -303,34 +370,10 @@ class TELlamaDecoderLayer(nn.Module):
         # Fully Connected with TE
         tp_group = get_tp_group().device_group
         self.layernorm_mlp.set_tensor_parallel_group(tp_group)
-        
-        # This code is from rmsnorm forward_native in sglang
         if residual is not None:
             hidden_states = hidden_states + residual
-            residual = hidden_states
-
-        seq_len = hidden_states.shape[0]
-        if seq_len > 1: # For prefill phase, split the sequence dimension
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
-            # Padding sequence
-            if seq_len % MAX_SEQ_LEN != 0:
-                pad_len = MAX_SEQ_LEN - seq_len % MAX_SEQ_LEN
-                pad_tensor = torch.zeros(pad_len, hidden_states.shape[1], device=hidden_states.device,
-                                         dtype=hidden_states.dtype)
-                hidden_states = torch.cat([hidden_states, pad_tensor], dim=0).contiguous()
-            hidden_states_slices = torch.chunk(hidden_states, tp_size, dim=0)
-            hidden_states = hidden_states_slices[tp_rank]
-
-        with sequence_parallel_context(self.layernorm_mlp, seq_len):
-            hidden_states = self.layernorm_mlp(hidden_states)
-
-        if seq_len > 1:
-            # TODO: remove manual all-gather 
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
-            # Remove padding
-            hidden_states = hidden_states[:seq_len].contiguous()
-        
+            residual = hidden_states        
+        hidden_states = self.layernorm_mlp(hidden_states)        
         return hidden_states, residual
 
 
@@ -349,13 +392,18 @@ class TELlamaModel(nn.Module):
         if MAX_SEQ_LEN % tp_size != 0:
             raise ValueError(f"To enable sequence parallel, TE requires MAX_SEQ_LEN {MAX_SEQ_LEN} to be divisible by tp_size {tp_size}")
 
-        te.pytorch.initialize_ub(
-            [MAX_SEQ_LEN, config.hidden_size],
-            tp_size,
-            use_fp8=False,
-            dtype=torch.bfloat16,
-            bootstrap_backend="nccl",
-        )
+        config.tp_comm_overlap = False
+        config.sequence_parallel = False
+        
+        if config.tp_comm_overlap:
+            te.pytorch.initialize_ub(
+                [MAX_SEQ_LEN, config.hidden_size],
+                tp_size,
+                use_fp8=False,
+                dtype=torch.bfloat16,
+                bootstrap_backend="nccl",
+            )
+        
         # token embedding
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -386,16 +434,37 @@ class TELlamaModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
+        
+        seq_len = hidden_states.shape[0]
+        if seq_len > 1 and self.config.sequence_parallel: # For prefill phase, split the sequence dimension
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            # Padding sequence
+            if seq_len % MAX_SEQ_LEN != 0:
+                pad_len = MAX_SEQ_LEN - seq_len % MAX_SEQ_LEN
+                pad_tensor = torch.zeros(pad_len, hidden_states.shape[1], device=hidden_states.device,
+                                         dtype=hidden_states.dtype)
+                hidden_states = torch.cat([hidden_states, pad_tensor], dim=0).contiguous()
+            hidden_states_slices = torch.chunk(hidden_states, tp_size, dim=0)
+            hidden_states = hidden_states_slices[tp_rank]
+        
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
+            with sequence_parallel_context(layer.layernorm_mlp, seq_len):
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                )
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        if seq_len > 1 and self.config.sequence_parallel:
+            # TODO: remove manual all-gather 
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
+            # Remove padding
+            hidden_states = hidden_states[:seq_len].contiguous()
         return hidden_states
 
 
@@ -501,30 +570,36 @@ class TELlamaForCausalLM(nn.Module):
 
             if "self_attn.q_proj.weight" in name:
                 qkv_name = name.replace(
-                    "self_attn.q_proj.weight", "self_attn.qkv_proj.weight"
+                    "self_attn.q_proj.weight", "self_attn.qkv_proj.q_weight"
                 )
                 assert qkv_name in params_dict
                 param = params_dict[qkv_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, "q")
+                param_chunks = torch.chunk(loaded_weight, tp_size, dim=0)
+                default_weight_loader(param, param_chunks[tp_rank])
 
             elif "self_attn.k_proj.weight" in name:
                 qkv_name = name.replace(
-                    "self_attn.k_proj.weight", "self_attn.qkv_proj.weight"
+                    "self_attn.k_proj.weight", "self_attn.qkv_proj.k_weight"
                 )
                 assert qkv_name in params_dict
                 param = params_dict[qkv_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, "k")
+                param_chunks = torch.chunk(loaded_weight, tp_size, dim=0)
+                default_weight_loader(param, param_chunks[tp_rank])
 
             elif "self_attn.v_proj.weight" in name:
                 qkv_name = name.replace(
-                    "self_attn.v_proj.weight", "self_attn.qkv_proj.weight"
+                    "self_attn.v_proj.weight", "self_attn.qkv_proj.v_weight"
                 )
                 assert qkv_name in params_dict
                 param = params_dict[qkv_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, "v")
+                param_chunks = torch.chunk(loaded_weight, tp_size, dim=0)
+                default_weight_loader(param, param_chunks[tp_rank])
+            
+            elif "self_attn.o_proj.weight" in name:
+                assert name in params_dict
+                param = params_dict[name]
+                param_chunks = torch.chunk(loaded_weight, tp_size, dim=1)
+                default_weight_loader(param, param_chunks[tp_rank])
             
             elif "post_attention_layernorm.weight" in name:
                 te_name = name.replace(
